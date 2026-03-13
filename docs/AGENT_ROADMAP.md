@@ -12,6 +12,20 @@ and displays real-time presence, activity, movement intensity and breathing rate
 
 ---
 
+## Build Status
+
+| Step | Description | Status |
+|------|------------|--------|
+| Step 1 | Repository Structure | DONE |
+| Step 2 | Backend (FastAPI) | DONE |
+| Step 3 | Frontend (Next.js 14) | DONE |
+| Step 4 | Docker Setup | DONE |
+| Step 5 | ESP32 Docs | DONE (docs/ESP32_SETUP.md + esp32/config.h.example) |
+
+**All V1 steps are complete.** The app is runnable locally and via Docker.
+
+---
+
 ## Build Order
 
 ### Step 1 – Repository Structure
@@ -126,6 +140,18 @@ Must be Coolify-compatible: no hardcoded ports, use environment variables.
 - **Calibration is simple** – record 30s baseline per activity, compute mean/std, store in SQLite
 - **ESP32-S3 N16R8 specific** – 64 subcarriers, 2.4GHz, 1x1 MIMO
 - **Do not over-engineer** – V1 must be runnable in one `docker-compose up`
+- **Python 3.9 compatibility** – use `typing.Optional`, `typing.List`, `typing.Dict` instead of `X | None`, `list[x]`, `dict[x]`
+
+---
+
+## Implementation Notes
+
+- Backend falls back to **demo mode** (synthetic CSI data) when no ESP32 is connected
+- Frontend uses `NEXT_PUBLIC_BACKEND_URL` env var (default: `http://localhost:8000`)
+- WebSocket clients must send periodic messages ("ping") to keep connection alive
+- Events are written to DB every ~5 seconds (every 10th frame) to avoid flooding
+- Breathing rate returns `null` until ~32 seconds of data buffer is filled
+- Next.js uses `output: "standalone"` for Docker deployment
 
 ---
 
