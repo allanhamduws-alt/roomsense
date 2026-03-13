@@ -1,0 +1,14 @@
+#pragma once
+
+// WiFi credentials
+#define WIFI_SSID      "YourWiFiName"
+#define WIFI_PASSWORD  "YourWiFiPassword"
+
+// UDP target (IP of your Mac or server running the backend)
+// Only needed if using UDP mode
+#define UDP_SERVER_IP  "192.168.178.100"
+#define UDP_PORT       5005
+
+// CSI config
+#define CSI_CHANNEL    6
+#define CSI_BANDWIDTH  20  // MHz
