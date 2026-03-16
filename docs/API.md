@@ -2,6 +2,8 @@
 
 Base URL: `http://localhost:8000`
 
+Quick test: `curl http://localhost:8000/status`
+
 ## REST Endpoints
 
 ### GET /status

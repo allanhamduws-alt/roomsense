@@ -14,14 +14,14 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-from calibration import get_empty_baseline, load_baselines, record_calibration
+from calibration import baselines, get_empty_baseline, load_baselines, record_calibration
 from csi_parser import parse_csi_string
 from database import get_history, init_db, insert_event
-from detector import analyze
+from detector import analyze, reset_detector, set_calibration_thresholds
 
 load_dotenv()
 
-INPUT_MODE = os.getenv("INPUT_MODE", "serial")
+INPUT_MODE = os.getenv("INPUT_MODE", "udp")
 SERIAL_PORT = os.getenv("SERIAL_PORT", "/dev/tty.usbmodem1234")
 UDP_PORT = int(os.getenv("WIFI_UDP_PORT", "5005"))
 
@@ -40,51 +40,71 @@ reader_task: Optional[asyncio.Task] = None
 # --- Data reader loops ---
 
 async def serial_reader():
-    """Read CSI data from serial port in a background thread."""
-    loop = asyncio.get_event_loop()
-
-    def _read_serial():
-        try:
-            ser = serial.Serial(SERIAL_PORT, 115200, timeout=1)
-            while True:
-                line = ser.readline().decode("utf-8", errors="ignore").strip()
-                if line:
-                    yield line
-        except serial.SerialException as e:
-            print(f"Serial error: {e}. Running in demo mode.")
-            yield from _demo_generator()
-
-    for line in await loop.run_in_executor(None, lambda: list(_read_lines_serial())):
-        await process_csi_line(line)
-
-
-def _read_lines_serial():
-    """Generator that yields serial lines."""
+    """Read CSI data from serial port using a background thread and queue."""
     try:
-        ser = serial.Serial(SERIAL_PORT, 115200, timeout=1)
+        ser = serial.Serial(SERIAL_PORT, 921600, timeout=1)
+    except serial.SerialException as e:
+        print(f"Serial error: {e}. Falling back to demo mode.")
+        await demo_reader()
+        return
+
+    import threading
+    import queue
+
+    line_queue: queue.Queue = queue.Queue(maxsize=10)
+
+    def _reader_thread():
+        """Background thread that reads serial and puts latest CSI line in queue."""
         while True:
-            line = ser.readline().decode("utf-8", errors="ignore").strip()
-            if line:
-                yield line
-    except serial.SerialException:
-        yield from []
+            try:
+                line = ser.readline().decode("utf-8", errors="ignore").strip()
+                if line and "CSI_DATA" in line:
+                    # Drop old data, keep only latest
+                    while not line_queue.empty():
+                        try:
+                            line_queue.get_nowait()
+                        except queue.Empty:
+                            break
+                    line_queue.put(line)
+            except Exception:
+                break
+
+    thread = threading.Thread(target=_reader_thread, daemon=True)
+    thread.start()
+    print("Serial reader thread started")
+
+    while True:
+        # Check queue for new data at ~2Hz
+        await asyncio.sleep(0.5)
+        try:
+            line = line_queue.get_nowait()
+            await process_csi_line(line)
+        except queue.Empty:
+            pass
 
 
 async def udp_reader():
-    """Read CSI data from UDP socket."""
+    """Read CSI data from UDP socket at full 100Hz, downsample for detection."""
     loop = asyncio.get_event_loop()
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     sock.bind(("0.0.0.0", UDP_PORT))
     sock.setblocking(False)
+
+    # Process every Nth packet for detection (100Hz -> 10Hz)
+    packet_count = 0
+    PROCESS_EVERY = 10
 
     while True:
         try:
             data = await loop.sock_recv(sock, 4096)
-            line = data.decode("utf-8", errors="ignore").strip()
-            if line:
-                await process_csi_line(line)
+            packet_count += 1
+            if packet_count % PROCESS_EVERY == 0:
+                line = data.decode("utf-8", errors="ignore").strip()
+                if line:
+                    await process_csi_line(line)
         except Exception:
-            await asyncio.sleep(0.1)
+            await asyncio.sleep(0.01)
 
 
 async def demo_reader():
@@ -129,22 +149,7 @@ async def process_csi_line(line: str):
             breathing_rate=result["breathing_rate"],
         )
 
-    # Broadcast to WebSocket clients
-    await broadcast(result)
-
-
-async def broadcast(data: dict):
-    """Send data to all connected WebSocket clients."""
-    if not connected_clients:
-        return
-    message = json.dumps(data, default=str)
-    disconnected = set()
-    for ws in connected_clients:
-        try:
-            await ws.send_text(message)
-        except Exception:
-            disconnected.add(ws)
-    connected_clients -= disconnected
+    # WebSocket clients read from latest_status directly
 
 
 # --- App lifecycle ---
@@ -155,11 +160,12 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
 
     await init_db()
     await load_baselines()
+    set_calibration_thresholds(baselines)
 
     # Start the appropriate reader
     if INPUT_MODE == "serial":
         try:
-            serial.Serial(SERIAL_PORT, 115200, timeout=0.1).close()
+            serial.Serial(SERIAL_PORT, 921600, timeout=0.1).close()
             reader_task = asyncio.create_task(serial_reader())
             print(f"Reading CSI from serial: {SERIAL_PORT}")
         except serial.SerialException:
@@ -206,6 +212,30 @@ async def get_status():
     }
 
 
+@app.get("/debug")
+async def debug_status():
+    """Debug endpoint showing raw detector internals."""
+    import time as _time
+    from detector import (
+        _frame_count, _baseline_collected, _motion_threshold,
+        _turbulence_buffer, _mv_buffer, intensity_history,
+        _last_motion_time, _recent_peak_mv, HOLD_SECONDS,
+    )
+    now = _time.time()
+    hold_remaining = max(0, HOLD_SECONDS - (now - _last_motion_time)) if _last_motion_time > 0 else 0
+    return {
+        "frame_count": _frame_count,
+        "calibrated": _baseline_collected,
+        "motion_threshold": round(_motion_threshold, 6),
+        "current_mv": round(_mv_buffer[-1], 6) if _mv_buffer else None,
+        "recent_mv": [round(x, 6) for x in list(_mv_buffer)[-8:]],
+        "peak_mv": round(_recent_peak_mv, 6),
+        "hold_remaining_s": round(hold_remaining, 1),
+        "intensity_history": [round(x, 1) for x in intensity_history],
+        **latest_status,
+    }
+
+
 class CalibrationRequest(BaseModel):
     label: str
     snapshots: List[List[float]]
@@ -215,7 +245,18 @@ class CalibrationRequest(BaseModel):
 async def calibrate(req: CalibrationRequest):
     """Receive calibration label + CSI snapshots."""
     result = await record_calibration(req.label, req.snapshots)
+    set_calibration_thresholds(baselines)
     return result
+
+
+@app.post("/reset")
+async def reset():
+    """Reset detector for fresh auto-calibration.
+
+    Call this when the room is EMPTY, then wait ~20s for recalibration.
+    """
+    reset_detector()
+    return {"status": "ok", "message": "Detector reset. Auto-calibration starts now (~20s)."}
 
 
 @app.get("/history")
@@ -229,12 +270,13 @@ async def history(limit: int = 100):
 async def websocket_endpoint(ws: WebSocket):
     """Stream live status at ~2Hz."""
     await ws.accept()
-    connected_clients.add(ws)
     try:
         while True:
-            # Keep connection alive, wait for client messages (ping/pong)
-            await ws.receive_text()
+            # Send latest status every 500ms
+            data = json.dumps(latest_status, default=str)
+            await ws.send_text(data)
+            await asyncio.sleep(0.5)
     except WebSocketDisconnect:
-        connected_clients.discard(ws)
+        pass
     except Exception:
-        connected_clients.discard(ws)
+        pass

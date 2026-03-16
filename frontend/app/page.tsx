@@ -6,6 +6,7 @@ import PresenceCard from "@/components/PresenceCard";
 import ActivityCard from "@/components/ActivityCard";
 import BreathingCard from "@/components/BreathingCard";
 import IntensityMeter from "@/components/IntensityMeter";
+import BreathingVisualizer from "@/components/BreathingVisualizer";
 
 const BACKEND_URL =
   process.env.NEXT_PUBLIC_BACKEND_URL || "http://localhost:8000";
@@ -102,6 +103,11 @@ export default function Dashboard() {
         <IntensityMeter intensity={status.intensity} />
         <BreathingCard breathingRate={status.breathing_rate} />
       </div>
+
+      <BreathingVisualizer
+        breathingRate={status.breathing_rate}
+        intensity={status.intensity}
+      />
 
       <LiveCSIGraph amplitudes={status.amplitudes} />
     </div>

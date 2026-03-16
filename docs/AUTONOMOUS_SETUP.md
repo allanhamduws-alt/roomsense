@@ -12,6 +12,21 @@ verify CSI data output, and connect it to the running RoomSense backend.
 
 ---
 
+## IMPORTANT: Known Gotchas (learned from first setup)
+
+1. **Firmware-Beispiel:** Nutze `~/esp/esp-csi/examples/get-started/csi_recv_router` — NICHT `console_test` (existiert nicht mehr in neueren ESP-CSI Versionen)
+2. **SSID genau prüfen:** Der User hat `FRITZ!Box` (mit `!`), nicht `FRITZ.Box` (mit `.`). Screenshot vom Mac-WLAN-Einstellungen prüfen!
+3. **WiFi Auth:** FritzBox nutzt WPA2. Setze `CONFIG_EXAMPLE_WIFI_AUTH_WPA_WPA2_PSK=y` in `sdkconfig.defaults`
+4. **Retries erhöhen:** `CONFIG_EXAMPLE_WIFI_CONN_MAX_RETRY=20` — der Standard (6) ist zu niedrig bei schwachem Signal
+5. **sdkconfig löschen:** Nach Änderungen an `sdkconfig.defaults` muss die alte `sdkconfig` gelöscht werden (`rm -f sdkconfig`), dann `idf.py set-target` erneut ausführen
+6. **Baud Rate:** Serial-Kommunikation läuft mit **921600** Baud, nicht 115200
+7. **CSI Format:** IQ-Daten stehen in eckigen Klammern `"[i0,q0,i1,q1,...]"` am Ende der Zeile
+8. **ESP-IDF source:** In bash-Subshell ausführen: `bash -c 'export IDF_PATH=... && . $IDF_PATH/export.sh && idf.py ...'`
+9. **Backend ohne --reload starten:** `python3 -u -m uvicorn main:app --port 8000` (--reload kann Serial-Verbindung unterbrechen)
+10. **Board Boot-Modus:** Wenn Port `/dev/cu.usbmodem101` nicht erscheint → User muss BOOT+RST drücken und macOS Popup "Verbinden" bestätigen
+
+---
+
 ## Pre-Checks (run first, autonomously)
 
 ```bash
@@ -21,8 +36,8 @@ ls ~/esp/esp-idf 2>/dev/null && echo 'ESP-IDF EXISTS' || echo 'NEEDS INSTALL'
 # Check if ESP-CSI already cloned
 ls ~/esp/esp-csi 2>/dev/null && echo 'ESP-CSI EXISTS' || echo 'NEEDS CLONE'
 
-# Check if board is connected
-ls /dev/cu.* 2>/dev/null
+# Check if board is connected (look for usbmodem, NOT just Bluetooth)
+ls /dev/cu.usbmodem* 2>/dev/null && echo 'BOARD FOUND' || echo 'BOARD NOT FOUND'
 
 # Check if brew is installed
 brew --version 2>/dev/null && echo 'BREW OK' || echo 'BREW MISSING'
@@ -31,7 +46,13 @@ brew --version 2>/dev/null && echo 'BREW OK' || echo 'BREW MISSING'
 python3 --version 2>/dev/null
 
 # Check if .env exists in project
-ls ~/roomsense/.env 2>/dev/null && echo 'ENV EXISTS' || echo 'ENV MISSING'
+ls ~/Vibe/roomsense/.env 2>/dev/null && echo 'ENV EXISTS' || echo 'ENV MISSING'
+
+# Check if backend is running
+curl -s http://localhost:8000/status 2>/dev/null && echo 'BACKEND RUNNING' || echo 'BACKEND NOT RUNNING'
+
+# Check if frontend is running
+curl -s http://localhost:3000 >/dev/null 2>&1 && echo 'FRONTEND RUNNING' || echo 'FRONTEND NOT RUNNING'
 ```
 
 Based on output: skip steps that are already done. Continue with what is missing.
@@ -44,11 +65,6 @@ Based on output: skip steps that are already done. Continue with what is missing
 brew install cmake ninja dfu-util python3
 ```
 
-If brew is missing:
-```bash
-/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
-```
-
 ---
 
 ## Step 2 – Install ESP-IDF (skip if ~/esp/esp-idf exists)
@@ -59,6 +75,7 @@ cd ~/esp
 git clone --recursive https://github.com/espressif/esp-idf.git
 cd esp-idf
 git checkout v5.2
+git submodule update --init --recursive --force
 ./install.sh esp32s3
 ```
 
@@ -77,166 +94,151 @@ git clone https://github.com/espressif/esp-csi.git
 
 ## Step 4 – Configure WiFi Credentials
 
+🔴 MANUAL: Ask user for WiFi SSID and Password. Verify SSID spelling carefully (e.g. `!` vs `.`).
+
+Create `sdkconfig.defaults` with credentials:
+
 ```bash
-# Source ESP-IDF environment
-source ~/esp/esp-idf/export.sh
+cd ~/esp/esp-csi/examples/get-started/csi_recv_router
 
-# Go to the console_test example
-cd ~/esp/esp-csi/examples/console_test
+cat >> sdkconfig.defaults << 'EOF'
 
-# Open menuconfig to set WiFi SSID and Password
-idf.py menuconfig
-```
-
-🔴 MANUAL ACTION REQUIRED:
-In the menuconfig TUI that opens:
-1. Navigate to: `Example Configuration`
-2. Set `WiFi SSID` → enter the FritzBox WiFi name
-3. Set `WiFi Password` → enter the FritzBox WiFi password
-4. Press `S` to save, then `Q` to quit
-
-After user confirms menuconfig is done, continue.
-
-Alternative (if menuconfig is hard): create sdkconfig.defaults:
-```bash
-cat > sdkconfig.defaults << 'EOF'
-CONFIG_EXAMPLE_WIFI_SSID="FRITZBOX_NAME_HERE"
-CONFIG_EXAMPLE_WIFI_PASSWORD="FRITZBOX_PASSWORD_HERE"
+# WiFi Credentials
+CONFIG_EXAMPLE_WIFI_SSID="EXACT_SSID_HERE"
+CONFIG_EXAMPLE_WIFI_PASSWORD="PASSWORD_HERE"
+CONFIG_EXAMPLE_CONNECT_WIFI=y
+CONFIG_EXAMPLE_WIFI_AUTH_WPA_WPA2_PSK=y
+CONFIG_EXAMPLE_WIFI_CONN_MAX_RETRY=20
+CONFIG_EXAMPLE_WIFI_SCAN_METHOD_ALL_CHANNEL=y
+CONFIG_ESP_WIFI_CSI_ENABLED=y
 EOF
 ```
-🔴 MANUAL: Ask user for WiFi SSID and Password, fill in above, then continue.
+
+Then delete old config and reconfigure:
+```bash
+rm -f sdkconfig
+```
 
 ---
 
 ## Step 5 – Set Target and Build
 
 ```bash
-source ~/esp/esp-idf/export.sh
-cd ~/esp/esp-csi/examples/console_test
-idf.py set-target esp32s3
-idf.py build
+bash -c 'export IDF_PATH=~/esp/esp-idf && . $IDF_PATH/export.sh && \
+  cd ~/esp/esp-csi/examples/get-started/csi_recv_router && \
+  idf.py set-target esp32s3 && \
+  idf.py build'
 ```
 
 Build takes 2–5 minutes. Wait for `Project build complete` message.
+
+Verify WiFi credentials are in the generated sdkconfig:
+```bash
+grep "WIFI_SSID\|WIFI_PASSWORD\|WIFI_AUTH" ~/esp/esp-csi/examples/get-started/csi_recv_router/sdkconfig
+```
 
 ---
 
 ## Step 6 – Detect Board Port
 
 ```bash
-ls /dev/cu.* 
+ls /dev/cu.usbmodem* 2>/dev/null
 ```
 
 🔴 MANUAL ACTION REQUIRED (only if board not found):
 - Make sure USB-C cable is plugged into the board AND the Mac
 - Use a DATA cable, not a charge-only cable
-- If still not found: hold BOOT button, press RST, release BOOT
-- Run `ls /dev/cu.*` again
+- Hold BOOT button, press RST, release BOOT
+- Accept macOS "Allow Accessory" popup
+- Run `ls /dev/cu.usbmodem*` again
 
-Expected output example: `/dev/cu.usbmodem1234` or `/dev/cu.SLAB_USBtoUART`
-
-Save the port name for next steps.
+Expected: `/dev/cu.usbmodem101` or similar.
 
 ---
 
 ## Step 7 – Flash Firmware
 
 ```bash
-source ~/esp/esp-idf/export.sh
-cd ~/esp/esp-csi/examples/console_test
-
-# Replace PORT with actual port from Step 6
-idf.py -p PORT flash
+bash -c 'export IDF_PATH=~/esp/esp-idf && . $IDF_PATH/export.sh && \
+  cd ~/esp/esp-csi/examples/get-started/csi_recv_router && \
+  idf.py -p /dev/cu.usbmodem101 erase-flash && \
+  idf.py -p /dev/cu.usbmodem101 flash'
 ```
 
-If error `Failed to connect`:
-```bash
-# Try with manual boot mode
-# 1. Hold BOOT button on board
-# 2. Run the flash command
-# 3. Release BOOT when upload starts
-idf.py -p PORT flash
-```
+Note: `erase-flash` first clears old NVS data (prevents stale WiFi configs).
+
+If `Failed to connect` error: user must hold BOOT button during flash command.
 
 ---
 
 ## Step 8 – Verify CSI Output
 
-```bash
-source ~/esp/esp-idf/export.sh
-cd ~/esp/esp-csi/examples/console_test
-idf.py -p PORT monitor
+```python
+python3 -c "
+import serial, time, re
+ser = serial.Serial('/dev/cu.usbmodem101', 921600, timeout=1)
+start = time.time()
+csi_count = 0
+while time.time() - start < 35:
+    line = ser.readline().decode(errors='ignore').strip()
+    if line:
+        clean = re.sub(r'\x1b\[[0-9;]*m', '', line)
+        if 'CSI_DATA' in clean:
+            csi_count += 1
+            if csi_count <= 3:
+                print(clean[:150])
+            if csi_count >= 5:
+                break
+        elif any(k in clean.lower() for k in ['connect', 'got ip', 'wifi:', 'reason']):
+            print(clean)
+ser.close()
+print(f'CSI packets: {csi_count}')
+print('SUCCESS' if csi_count > 0 else 'FAILED - check WiFi credentials')
+"
 ```
 
-Wait 10–15 seconds for WiFi connection.
-
-Expected output (success):
-```
-I (1234) wifi: connected to AP
-CSI_DATA,0,AA:BB:CC:DD:EE:FF,1,6,1,1,0,0,64,[10 12 -3 5 ...]
-CSI_DATA,0,AA:BB:CC:DD:EE:FF,1,6,1,1,0,0,64,[11 10 -2 6 ...]
-```
-
-If you see `CSI_DATA` lines → SUCCESS ✅
-If you only see boot logs but no CSI → wait 30s more, router may be slow
-If WiFi fails → repeat Step 4 with correct credentials
-
-Press Ctrl+] to exit monitor.
+If SUCCESS → continue. If FAILED:
+- Check WiFi credentials (SSID spelling!)
+- Check WiFi auth mode (WPA2 vs WPA3)
+- Try `CONFIG_EXAMPLE_WIFI_AUTH_WPA2_WPA3_PSK=y` instead
+- Rebuild and reflash
 
 ---
 
 ## Step 9 – Connect Board to RoomSense Backend
 
 ```bash
-# Find exact port
-PORT=$(ls /dev/cu.usbmodem* 2>/dev/null || ls /dev/cu.SLAB* 2>/dev/null | head -1)
-echo "Board port: $PORT"
-
-# Update .env in roomsense project
-cd ~/roomsense  # or wherever the project is cloned
-
-# Check current .env
-cat .env
-
-# Update SERIAL_PORT and INPUT_MODE
+# Update .env in project
+cd ~/Vibe/roomsense
+sed -i '' 's|SERIAL_PORT=.*|SERIAL_PORT=/dev/cu.usbmodem101|' .env
 sed -i '' 's|INPUT_MODE=.*|INPUT_MODE=serial|' .env
-sed -i '' "s|SERIAL_PORT=.*|SERIAL_PORT=$PORT|" .env
-
-# Verify
 cat .env
 ```
 
 ---
 
-## Step 10 – Restart Backend and Verify Live Data
+## Step 10 – Start Backend and Verify Live Data
 
 ```bash
-# If running with docker-compose
-cd ~/roomsense
-docker-compose restart backend
-
-# If running locally with Python
-# Kill existing backend process and restart
-pkill -f uvicorn
-cd ~/roomsense/backend
-pip install -r requirements.txt
-uvicorn main:app --reload --port 8000 &
-```
-
-Wait 5 seconds, then check:
-```bash
+pkill -f uvicorn 2>/dev/null
+sleep 1
+cd ~/Vibe/roomsense/backend
+python3 -u -m uvicorn main:app --port 8000 &
+sleep 5
 curl http://localhost:8000/status
 ```
 
-Expected response:
+Expected: JSON with real values (intensity > 0 if someone is in the room):
 ```json
-{"presence": false, "intensity": 0, "activity": "still", "breathing_rate": null}
+{"presence": true, "activity": "sitting", "intensity": 19.7, "breathing_rate": null}
 ```
 
-If you get a valid JSON response → backend is running ✅
+If intensity is always 0.0 and presence is always false:
+- Check that Serial Baud in `main.py` is **921600** (not 115200)
+- Check that `csi_parser.py` uses regex `\[([^\]]+)\]` to extract IQ data from brackets
 
-Open browser: http://localhost:3000
-The CSI graph should now show live data (non-zero values, moving lines).
+Frontend should already be running at http://localhost:3000.
+If not: `cd ~/Vibe/roomsense/frontend && npm run dev`
 
 ---
 
@@ -244,11 +246,11 @@ The CSI graph should now show live data (non-zero values, moving lines).
 
 1. Wave your hand in front of the board
 2. Check dashboard at http://localhost:3000
-3. `presence` should flip to `YES`
+3. `presence` should show `YES`
 4. `intensity` should jump above 0
 5. CSI graph lines should move
 
-If all 3 work → Setup complete ✅
+If all work → Setup complete ✅
 
 ---
 
@@ -256,20 +258,24 @@ If all 3 work → Setup complete ✅
 
 | Problem | Solution |
 |---|---|
-| Board not detected | Try different USB-C cable (must be data cable) |
-| Flash fails | Hold BOOT while running `idf.py flash` |
-| No CSI data | Check WiFi credentials in menuconfig |
+| Board not detected | Try different USB-C cable (must be data cable), accept macOS popup |
+| Flash fails | Hold BOOT while running flash command |
+| `waiting for download` in serial | Board stuck in boot mode — press RST once (without BOOT) |
+| WiFi won't connect | Check SSID spelling (! vs .), check auth mode, increase retry count |
+| No CSI data but WiFi connected | Wait 30s, router may be slow to respond |
+| Backend intensity always 0 | Check Baud (921600) and CSI parser (bracket regex) |
 | Backend not receiving data | Check SERIAL_PORT in .env matches actual port |
 | Permission denied on port | `sudo chmod 666 /dev/cu.usbmodem*` |
-| ESP-IDF command not found | Run `source ~/esp/esp-idf/export.sh` first |
+| ESP-IDF command not found | Use bash subshell: `bash -c '. ~/esp/esp-idf/export.sh && idf.py ...'` |
+| `--reload` breaks serial | Don't use `--reload` with serial input, use plain `uvicorn` |
 
 ---
 
 ## Success Criteria
 
-- [ ] Board detected on `/dev/cu.*`
-- [ ] Firmware flashed without errors
-- [ ] CSI_DATA lines visible in serial monitor
-- [ ] Backend `/status` returns valid JSON
-- [ ] Dashboard shows live CSI graph
-- [ ] Hand wave triggers presence detection
+- [x] Board detected on `/dev/cu.usbmodem101`
+- [x] Firmware flashed without errors
+- [x] CSI_DATA lines visible in serial monitor
+- [x] Backend `/status` returns valid JSON with real values
+- [x] Dashboard shows live CSI graph
+- [x] Hand wave triggers presence detection
